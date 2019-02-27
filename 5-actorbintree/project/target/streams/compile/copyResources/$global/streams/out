@@ -1,2 +1,2 @@
-[0m[[0m[0mdebug[0m] [0m[0mCopy resource mappings: [0m
-[0m[[0m[0mdebug[0m] [0m[0m	(/Users/diego/projetos/reactive-programing-course/5-actorbintree/project/target/scala-2.12/sbt-1.0/resource_managed/main/sbt/sbt.autoplugins,/Users/diego/projetos/reactive-programing-course/5-actorbintree/project/target/scala-2.12/sbt-1.0/classes/sbt/sbt.autoplugins)[0m
+[debug] Copy resource mappings: 
+[debug] 	(/Users/diego/projetos/reactive-programing-course/5-actorbintree/project/target/scala-2.12/sbt-1.0/resource_managed/main/sbt/sbt.autoplugins,/Users/diego/projetos/reactive-programing-course/5-actorbintree/project/target/scala-2.12/sbt-1.0/classes/sbt/sbt.autoplugins)

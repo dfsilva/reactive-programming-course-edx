@@ -1,19 +1,13 @@
 package kvstore
 
-import akka.actor.{ OneForOneStrategy, Props, ActorRef, Actor }
-import akka.event.Logging
-import akka.event.LoggingReceive
-import kvstore.Arbiter._
-import scala.collection.immutable.Queue
 import akka.actor.SupervisorStrategy.Restart
-import scala.annotation.tailrec
-import akka.pattern.{ ask, pipe }
-import akka.actor.Terminated
+import akka.actor._
+import kvstore.Arbiter._
+import kvstore.Persistence._
+import kvstore.Replica._
+import kvstore.Replicator._
+
 import scala.concurrent.duration._
-import akka.actor.PoisonPill
-import akka.actor.OneForOneStrategy
-import akka.actor.SupervisorStrategy
-import akka.util.Timeout
 
 object Replica {
   sealed trait Operation {
@@ -29,19 +23,17 @@ object Replica {
   case class OperationFailed(id: Long) extends OperationReply
   case class GetResult(key: String, valueOption: Option[String], id: Long) extends OperationReply
 
+  case class OneSecondTimeMachine(client: ActorRef, id: Long)
+
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
-  import Replica._
-  import Replicator._
-  import Persistence._
   import context.dispatcher
 
-  /*
-   * The contents of this actor is just a suggestion, you can implement it in any way you like.
-   */
-  
+  context.setReceiveTimeout(100.millis)
+  arbiter ! Join
+
   var kv = Map.empty[String, String]
 
   // a map from secondary replicas to replicators
@@ -50,298 +42,180 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
 
-  // the last acknowledged sequence number
-  var lastAckSeq = -1L
+  var expectedSeq: Long = 0
 
-  // the expected sequence number
-  var expectedSeq = 0L
+  val persistence = context.system.actorOf(persistenceProps)
 
-  var persister = context.actorOf(persistenceProps)
-  context.watch(persister)
-
-  // the outstanding persistence request sent by the secondary to persister
-  var acks = Map.empty[Long, (ActorRef, Snapshot)]
-
-  // the outstanding persistence request sent by the primary to persister
-  var persists = Map.empty[Long, (ActorRef, Replicate)]
-
-  // the outstanding persistence and replication requests waiting 
-  // by the primary 
-  var waitings = Map.empty[Long, (ActorRef, Set[ActorRef])]
-
-  // replicator actorRef -> number of replicate requests waiting
-  // by the primary
-  var pendingReplicatorRequests = Map.empty[ActorRef, Int]
-
-  // When a replicator is created, the primary must forward update events
-  // it currently holds to the replicator
-  // Replicator actorRef -> list of Replicate events
-  var pendingReplicatorUpdates = Map.empty[ActorRef, List[Replicate]]
-
-  val log = Logging(context.system, this)
-
-  // sequence number used for persistence request
-  var _seqCounter = 0L
-  def nextSeq = {
-    val ret = _seqCounter
-    _seqCounter += 1
-    ret
+  // restart persistence actor when it fails
+  override val supervisorStrategy = OneForOneStrategy() {
+    case _: PersistenceException => Restart
   }
 
-  override val supervisorStrategy = OneForOneStrategy(maxNrOfRetries = 5) {
-     case _: PersistenceException => SupervisorStrategy.Restart
-  }
+  // operation id -> (requestSource, requestMessage, ackMessage)
+  var persists = Map.empty[Long, (ActorRef, Persist, Object)]
 
-  context.system.scheduler.schedule(0.milliseconds, 50.milliseconds) {
-    acks foreach { case (persistId, (_, Snapshot(key, valueOption, seq))) => {
-        persister ! Persist(key, valueOption, persistId)
-      }
-    }
-    persists foreach { case (persistId, (_, Replicate(key, valueOption, seq))) => {
-        persister ! Persist(key, valueOption, persistId)
-      }
-    }
-  }
+  // operation id -> unacknowledged replicas
+  var replications = Map.empty[Long, Set[ActorRef]]
 
-  arbiter ! Join
+  // operation id -> source of original request
+  var replicationClients = Map.empty[Long, ActorRef]
 
   def receive = {
-    case JoinedPrimary   => context.become(leader)
+    case JoinedPrimary => context.become(leader)
     case JoinedSecondary => context.become(replica)
   }
 
-  /* TODO Behavior for  the leader role. */
-  val leader: Receive = LoggingReceive {
-    case Insert(key, value, id) => {
-      kv += key -> value
-      persistAndReplicate(sender, key, Some(value), id)
-    }
-    case Remove(key, id) => {
-      kv -= key
-      persistAndReplicate(sender, key, None, id)
-    }
-    case Get(key, id) => {
-      val opt = kv.get(key)
-      sender ! GetResult(key, opt, id)
-    }
-    case Replicas(replicas) => {
-      val others = replicas - self
-      val added = others filter { !secondaries.contains(_) }
-      val removed = secondaries.keySet filter { others.isEmpty || others.contains(_) }
-      added foreach { secondary => populateReplica(secondary) }
-      removed foreach { secondary => stopReplica(secondary) }
-    }
-    case Persisted(key, persistId) => {
-      if (persists contains persistId) {
-        val persist = persists.get(persistId)
-        persist match {
-          case Some((client, Replicate(k, v, id))) => {
-            persists -= persistId
-            checkWaitings(id, persister)
-          }
-          case None => 
-        }
-      }
-    }
-    case Replicated(key, id) => {
-      if (pendingReplicatorRequests contains sender) {
-        checkReplicaReady(sender)
-      } else {
-        checkWaitings(id, sender)
-      }
-    }
+  val getting: Receive = {
+    case Get(key: String, id: Long) =>
+      sender() ! GetResult(key, kv.get(key), id)
   }
 
-  // Persists in primary and replicate to secondaries
-  // Schedule timeout if no confirmation after lapsed time
-  def persistAndReplicate(client: ActorRef, key: String, value: Option[String], id: Long): Unit = {
-    val persistId = nextSeq
-    val replicate = Replicate(key, value, id)
-    var waitingForAcks = Set.empty[ActorRef]
-    replicators foreach { replicator => {
-      replicator ! replicate 
-      waitingForAcks += replicator
-    }}
-    pendingReplicatorRequests foreach {
-      case (replicator, count) => {
-        if (pendingReplicatorUpdates contains replicator) {
-          val updates = pendingReplicatorUpdates.get(replicator)
-          updates match {
-            case Some(replicates) => {
-              pendingReplicatorUpdates += replicator -> (replicates ::: List(replicate))
-              waitingForAcks += replicator
-            }
-            case None => 
-          }
-        } else {
-          pendingReplicatorUpdates += replicator -> List(replicate)
-          waitingForAcks += replicator
+  val persisting: Receive = {
+    case Persisted(key, id) =>
+      for ((source, _, ackMessage) <- persists.get(id)) {
+        persists -= id
+        // should only happen if all replications succeeded too
+        // and if it hasn't been ack'd already
+        replications.get(id) match {
+          case Some(unacked) if unacked.nonEmpty =>
+          case _ =>
+            replicationClients -= id
+            source ! ackMessage
         }
       }
-    }
-    persists += persistId -> (client, replicate)
-    persister ! Persist(key, value, persistId)
-    waitingForAcks += persister
-    waitings += id -> (client, waitingForAcks)
-    scheduleTimeout(client, id)
+
+    case ReceiveTimeout =>
+      for ((_, persistRequest, _) <- persists.values) {
+        persistence ! persistRequest
+      }
   }
 
-  // Schedule timeout for persistence requests failed on either primary or secondaries
-  // Send OperationFailed back to client
-  def scheduleTimeout(client: ActorRef, id: Long): Unit = {
-    context.system.scheduler.scheduleOnce(1.second) {
-      if (waitings contains id) {
-        waitings -= id
+  val leader: Receive = getting orElse persisting orElse {
+    case Insert(key: String, value: String, id: Long) =>
+      updatePrimary(sender(), key, Option(value), id)
+
+    case Remove(key: String, id: Long) =>
+      updatePrimary(sender(), key, None, id)
+
+    case OneSecondTimeMachine(client, id) =>
+      for (unacked <- replications.get(id) if unacked.nonEmpty) {
         client ! OperationFailed(id)
       }
-    }
-  }
 
-  // Replicate primary data to secondary
-  // If no primary data needs to be replicated, then secondary replica is ready
-  def populateReplica(secondary: ActorRef): Unit = {
-    var _seqCounter = 0L
-    def nextSeq = {
-      val ret = _seqCounter
-      _seqCounter += 1
-      ret
-    }
-
-    val replicator = context.actorOf(Replicator.props(secondary))
-    context.watch(replicator)
-    secondaries += secondary -> replicator
-
-    val count = kv.size
-    if (count > 0) {
-      kv foreach { 
-        case(key, value) => {
-          replicator ! Replicate(key, Some(value), nextSeq)
-        }
+      for (_ <- persists.get(id)) {
+        client ! OperationFailed(id)
       }
-      pendingReplicatorRequests += replicator -> count
-    } else {
-      replicators += replicator
-    }
-  }
 
-  def stopReplica(secondary: ActorRef): Unit = {
-    val r = secondaries.get(secondary)
-    r match {
-      case Some(replicator) => {
-        waitings foreach { case (id, (client, waitingForAcks)) => {
-          if (waitingForAcks contains replicator) {
-            val remainWaitingForAcks = waitingForAcks - replicator
-            if (remainWaitingForAcks.isEmpty) {
-              waitings -= id
-              client ! OperationAck(id)
-            } else {
-              waitings += id -> (client, remainWaitingForAcks)
-            }
-          }
-        }}
-        pendingReplicatorRequests -= replicator
-        pendingReplicatorUpdates -= replicator
-        secondaries -= secondary
-        context.stop(persister)
-        context.stop(replicator)
-      }
-      case None =>
-    }
-  }
-
-  def checkReplicaReady(replicator: ActorRef): Unit = {
-    val data = pendingReplicatorRequests.get(replicator)
-    data match {
-      case Some(count) => {
-        if (count == 1) {
-          pendingReplicatorRequests -= replicator
-          if (pendingReplicatorUpdates contains replicator) {
-            val updates = pendingReplicatorUpdates.get(replicator)
-            updates match {
-              case Some(replicates) => {
-                replicates foreach { replicate => {
-                  replicator ! replicate
-                }}
-              }
-              case None =>
-            }
-          }
-          replicators += replicator
-        } else {
-          pendingReplicatorRequests += replicator -> (count - 1)
-        }
-      }
-      case None =>
-    }
-  }
-
-  // Check if primary still waits for confirmation for persistence
-  // If no longer waiting, send OperationAck back to client
-  def checkWaitings(id: Long, responded: ActorRef): Unit = {
-    if (waitings contains id) {
-      val waiting = waitings.get(id)
-      waiting match {
-        case Some((client, waitingForAcks)) => {
-          val remainingWaitingForAcks = waitingForAcks - responded
-          if (remainingWaitingForAcks.isEmpty) {
-            waitings -= id
-            client ! OperationAck(id)
-          } else {
-            waitings += id -> (client, remainingWaitingForAcks)
-          }
-        }
+    case Replicated(key, id) =>
+      replications.get(id) match {
         case None =>
-      }
-    }
-  }
-
-  /* TODO Behavior for the replica role. */
-  val replica: Receive = LoggingReceive {
-    case Get(key, id) => {
-      val opt = kv.get(key)
-      sender ! GetResult(key, opt, id)
-    }
-    case Snapshot(key, valueOption, seq) => {
-      val expected = Math.max(expectedSeq, lastAckSeq + 1)
-      if (seq < expected) {
-        sender ! SnapshotAck(key, seq)
-      } else if (seq == expected) {
-        valueOption match {
-          case Some(value) => { kv += key -> value }
-          case None => { kv -= key }
-        }
-        val persistId = nextSeq
-        acks += persistId -> (sender, Snapshot(key, valueOption, seq))
-        persister ! Persist(key, valueOption, persistId)
-
-        // schedule for timeout for persistence request
-        context.system.scheduler.scheduleOnce(1.second) {
-          if (acks contains persistId) {
-            val ack = acks.get(persistId)
-            ack match {
-              case Some((replicator, Snapshot(k, v, seq))) => {
-                acks -= persistId
-              }
-              case None => 
+          if (!persists.contains(id)) {
+            replicationClients.get(id) match {
+              case None =>
+              case Some(replicationClient) =>
+                replicationClients -= id
+                replicationClient ! OperationAck(id)
             }
           }
-        }
-      }
-    }
-    case Persisted(key, id) => {
-      if (acks contains id) {
-        val ack = acks.get(id)
-        ack match {
-          case Some((replicator, Snapshot(k, v, seq))) => {
-            acks -= id
-            lastAckSeq = seq
-            expectedSeq = lastAckSeq + 1
-            replicator ! SnapshotAck(key, seq)
+
+        case Some(unackedReplicas) =>
+          val ackedReplicator = sender()
+          val maybeAcked = secondaries.find { case (_, replicator) => replicator == ackedReplicator }
+          val stillUnackedReplicas = maybeAcked.fold(unackedReplicas)({ case (r, _) => unackedReplicas - r })
+          if (stillUnackedReplicas.nonEmpty) {
+            replications = replications.updated(id, stillUnackedReplicas)
+          } else {
+            replications -= id
+            if (!persists.contains(id)) {
+              replicationClients.get(id) match {
+                case None =>
+                case Some(replicationClient) =>
+                  replicationClients -= id
+                  replicationClient ! OperationAck(id)
+              }
+            }
           }
-          case None => 
+      }
+
+    case Replicas(replicas) =>
+      val newSecondaries = replicas - self
+      val added = newSecondaries diff secondaries.keySet
+      val removed = secondaries.keySet diff newSecondaries
+
+      // remove old replicas
+      removed foreach { r =>
+        secondaries.get(r) match {
+          case None =>
+          case Some(replicator) =>
+            replicators -= replicator
+            context.system.stop(replicator)
+        }
+        secondaries -= r
+      }
+
+      // add new replicas
+      added foreach { r =>
+        val replicator = context.system.actorOf(Replicator.props(r))
+        secondaries = secondaries.updated(r, replicator)
+        replicators += replicator
+
+        kv foreach {
+          case (k, v) =>
+            val newId = scala.util.Random.nextInt()
+            replicator ! Replicate(k, Option(v), newId)
+            val currentSet = replications.getOrElse(newId, Set.empty)
+            replications = replications.updated(newId, currentSet + r)
         }
       }
+
+      // remove old replicas that remain unacknowledged
+      replications = replications flatMap {
+        case (id, unackedReplicas) =>
+          val stillUnacked = unackedReplicas.diff(removed)
+          if (stillUnacked.nonEmpty) Option(id -> stillUnacked)
+          else {
+            for (client <- replicationClients.get(id)) {
+              replicationClients -= id
+              client ! OperationAck(id)
+            }
+            None
+          }
+      }
+  }
+
+  val replica: Receive = getting orElse persisting orElse {
+    case snapshot @ Snapshot(key: String, valueOption: Option[String], seq: Long) =>
+      val replicator = sender()
+      if (seq < expectedSeq) {
+        replicator ! SnapshotAck(key, seq)
+      } else if (seq == expectedSeq) {
+        update(key, valueOption)
+        expectedSeq += 1
+        persist(replicator, Persist(key, valueOption, seq), SnapshotAck(key, seq))
+      }
+  }
+
+  def updatePrimary(client: ActorRef, key: String, updatedValue: Option[String], id: Long): Unit = {
+    update(key, updatedValue)
+    context.system.scheduler.scheduleOnce(1.second, self, OneSecondTimeMachine(client, id))
+    persist(client, Persist(key, updatedValue, id), OperationAck(id))
+    replications = replications.updated(id, secondaries.keySet)
+    replicationClients = replicationClients.updated(id, client)
+    replicators foreach { replicator =>
+      replicator ! Replicate(key, updatedValue, id)
     }
   }
 
+  def update(key: String, valueOption: Option[String]): Unit = {
+    valueOption match {
+      case Some(value) => kv = kv.updated(key, value)
+      case None => kv -= key
+    }
+  }
+
+  def persist(source: ActorRef, persistRequest: Persist, ackMessage: Object): Unit = {
+    persists = persists.updated(persistRequest.id, (source, persistRequest, ackMessage))
+    persistence ! persistRequest
+  }
 }
+
