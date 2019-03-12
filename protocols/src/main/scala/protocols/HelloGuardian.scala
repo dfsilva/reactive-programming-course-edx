@@ -41,12 +41,12 @@ object HelloGuardian {
 
     def main(args: Array[String]): Unit = {
         val system: ActorSystem[Guardian] = ActorSystem(guardian, "helloworld")
-    
+
         import akka.actor.typed.scaladsl.AskPattern._
         implicit val ec = ExecutionContext.global
         implicit val timeout = Timeout(3.seconds)
         implicit val scheduler = system.scheduler
-    
+
         for {
             greeter <- system ? NewGreeter
             _ = greeter ! Greet("world", system.deadLetters)
