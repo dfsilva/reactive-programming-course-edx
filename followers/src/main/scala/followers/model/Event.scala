@@ -35,7 +35,6 @@ object Event {
   def parse(message: String): Event = {
     val fields = message.split("\\|")
     val seqNr = fields.head.toInt
-
     fields(1) match {
       case "F" => Event.Follow(seqNr, fields(2).toInt, fields(3).toInt)
       case "U" => Event.Unfollow(seqNr, fields(2).toInt, fields(3).toInt)
